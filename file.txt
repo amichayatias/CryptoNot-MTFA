@@ -1,0 +1,494 @@
+#!/bin/bash
+
+PROJECT_DIR = "/Users/amichayatias/Desktop/crypto/crypto-trader-bot"
+
+# Create directories
+mkdir - p "$PROJECT_DIR/src/indicators"
+mkdir - p "$PROJECT_DIR/src/volume"
+mkdir - p "$PROJECT_DIR/src/signals"
+
+# Save index.ts
+cat << 'EOF' > "$PROJECT_DIR/src/index.ts"
+import Binance from 'binance-api-node';
+import WebSocket from 'ws';
+import Bottleneck from 'bottleneck';
+import { config } from './config/config';
+import { analyzeVolume } from './volume/volumeAnalysis';
+import { analyzeOrderBook } from './orderbook/orderBook';
+import { generateSignal, setClientAndSymbol } from './signals/signalGenerator';
+import { sendTelegramMessage } from './telegram/telegramBot';
+import { calculateRSI, calculateMACD } from './indicators/technicalIndicators';
+import logger from './utils/logger';
+
+const limiter = new Bottleneck({
+    minTime: 50, // 50ms for scalping speed
+    maxConcurrent: 1,
+});
+
+const client = Binance({
+    apiKey: config.binance.apiKey,
+    apiSecret: config.binance.apiSecret,
+});
+
+logger.info(`Client initialized: ${client ? 'success' : 'failure'}`);
+
+const symbol = 'BTCUSDT';
+const primaryTimeframe = '1m';
+const trendTimeframe = '1h';
+const confirmationTimeframe = '5m';
+
+// Cache for higher timeframe data
+let cached1hData = null;
+let cached5mData = null;
+let last1hUpdate = 0;
+let last5mUpdate = 0;
+
+// Set client and symbol for signalGenerator
+setClientAndSymbol(client, symbol);
+
+// Wrap client methods with rate limiter
+const wrappedClient = {
+    candles: limiter.wrap(client.candles.bind(client)),
+    book: limiter.wrap(client.book.bind(client)),
+    ping: limiter.wrap(client.ping.bind(client)),
+};
+
+async function updateCachedData() {
+    try {
+        const now = Date.now();
+        if (now - last1hUpdate > 5 * 60 * 1000) { // Update 1h every 5 minutes
+            cached1hData = {
+                rsi: await calculateRSI(wrappedClient, symbol, trendTimeframe),
+                macd: await calculateMACD(wrappedClient, symbol, trendTimeframe),
+                volume: await analyzeVolume(wrappedClient, symbol, null, trendTimeframe),
+            };
+            last1hUpdate = now;
+            logger.info(`Updated 1h cached data for ${symbol}`);
+        }
+        if (now - last5mUpdate > 60 * 1000) { // Update 5m every minute
+            cached5mData = {
+                rsi: await calculateRSI(wrappedClient, symbol, confirmationTimeframe),
+                volume: await analyzeVolume(wrappedClient, symbol, null, confirmationTimeframe),
+            };
+            last5mUpdate = now;
+            logger.info(`Updated 5m cached data for ${symbol}`);
+        }
+    } catch (error) {
+        logger.error(`Failed to update cached data: ${error}`);
+    }
+}
+
+async function startBot() {
+    try {
+        logger.info(`Starting bot for ${symbol} on ${primaryTimeframe} with ${trendTimeframe} trend`);
+        await wrappedClient.ping(); // Test API connectivity
+        const ws = new WebSocket(`wss://stream.binance.com:9443/ws/${symbol.toLowerCase()}@kline_${primaryTimeframe}`);
+
+        ws.on('message', async (data: string) => {
+            try {
+                const kline = JSON.parse(data).k;
+                if (kline.x) { // Closed candle
+                    logger.info(`Processing 1m closed candle for ${symbol} at ${new Date(kline.t).toUTCString()}`);
+                    await updateCachedData();
+
+                    const currentPrice = parseFloat(kline.c);
+                    const volumeData = {
+                        '1m': await analyzeVolume(wrappedClient, symbol, kline.v, primaryTimeframe),
+                        '5m': cached5mData?.volume || { spike: 1, isSignificant: false },
+                        '1h': cached1hData?.volume || { spike: 1, isSignificant: false },
+                    };
+                    const rsiData = {
+                        '1m': await calculateRSI(wrappedClient, symbol, primaryTimeframe),
+                        '5m': cached5mData?.rsi || 50,
+                        '1h': cached1hData?.rsi || 50,
+                    };
+                    const macdData = {
+                        '1m': await calculateMACD(wrappedClient, symbol, primaryTimeframe),
+                        '1h': cached1hData?.macd || { macd: 0, signal: 0, histogram: 0 },
+                    };
+                    const orderBookData = await analyzeOrderBook(wrappedClient, symbol);
+
+                    const signal = await generateSignal({
+                        volume: volumeData,
+                        orderBook: orderBookData,
+                        rsi: rsiData,
+                        macd: macdData,
+                        currentPrice,
+                    });
+
+                    if (signal) {
+                        await sendTelegramMessage(formatSignalMessage(signal));
+                        logger.info(`Signal generated: ${signal.type}`);
+                    }
+                }
+            } catch (error) {
+                logger.error(`Error processing WebSocket message: ${error}`);
+            }
+        });
+
+        ws.on('error', (error) => {
+            logger.error(`WebSocket error: ${error}`);
+        });
+    } catch (error) {
+        logger.error(`Failed to start bot: ${error}`);
+    }
+}
+
+function formatSignalMessage(signal: any): string {
+    return `
+📈 ${signal.type} Signal – ${symbol} (1m entry)
+• 1m RSI: ${signal.rsi['1m'].toFixed(2)} (${signal.rsi['1m'] < 20 ? 'Oversold' : signal.rsi['1m'] > 80 ? 'Overbought' : 'Normal'})
+• 5m RSI: ${signal.rsi['5m'].toFixed(2)}
+• 1h Trend: ${signal.macd['1h'].histogram > 0 ? 'Bullish' : 'Bearish'}
+• Volume Spike: 1m=${signal.volume['1m'].spike}x
+• Order book: ${signal.orderBook.buyerPressure ? 'Buyers dominate' : 'Sellers dominate'}
+• News Sentiment: ${signal.news}
+• SL: ${signal.stopLoss}% below entry
+• TP: ${signal.takeProfit}% above entry
+⏰ Time: ${new Date().toUTCString()}
+📊 Exchange: Binance
+🧠 Confidence: ${signal.confidence}
+  `;
+}
+
+startBot().catch((error) => logger.error(`Bot startup error: ${error}`));
+EOF
+
+# Save technicalIndicators.ts
+cat << 'EOF' > "$PROJECT_DIR/src/indicators/technicalIndicators.ts"
+import { RSI, MACD } from 'technicalindicators';
+import Binance from 'binance-api-node';
+import logger from '../utils/logger';
+
+export async function calculateRSI(client: any, symbol: string, timeframe: string): Promise<number> {
+    const period = timeframe === '1h' ? 14 : 8; // Faster for 1m/5m
+    try {
+        const candles = await client.candles({ symbol, interval: timeframe, limit: period + 1 });
+        const closes = candles.map((c: any) => parseFloat(c.close));
+        const rsiResult = RSI.calculate({ values: closes, period });
+        const rsi = rsiResult[rsiResult.length - 1];
+        if (rsi === undefined) {
+            throw new Error('RSI calculation returned undefined');
+        }
+        logger.info(`Calculated RSI for ${symbol} (${timeframe}): ${rsi}`);
+        return rsi;
+    } catch (error) {
+        logger.error(`Failed to calculate RSI for ${symbol} (${timeframe}): ${error}`);
+        throw error;
+    }
+}
+
+export async function calculateMACD(
+    client: any,
+    symbol: string,
+    timeframe: string
+): Promise<{ macd: number; signal: number; histogram: number }> {
+    const params = {
+        '1m': { fastPeriod: 6, slowPeriod: 13, signalPeriod: 4 }, // Optimized for scalping
+        '5m': { fastPeriod: 6, slowPeriod: 13, signalPeriod: 4 },
+        '1h': { fastPeriod: 12, slowPeriod: 26, signalPeriod: 9 },
+    }[timeframe] || { fastPeriod: 12, slowPeriod: 26, signalPeriod: 9 };
+
+    try {
+        const candles = await client.candles({ symbol, interval: timeframe, limit: params.slowPeriod + params.signalPeriod + 1 });
+        const closes = candles.map((c: any) => parseFloat(c.close));
+        const macdResult = MACD.calculate({
+            values: closes,
+            ...params,
+            SimpleMAOscillator: true,
+            SimpleMASignal: true,
+        });
+        const latest = macdResult[macdResult.length - 1];
+        if (!latest || latest.MACD === undefined || latest.signal === undefined || latest.histogram === undefined) {
+            throw new Error('MACD calculation returned undefined values');
+        }
+        logger.info(`Calculated MACD for ${symbol} (${timeframe}): ${JSON.stringify(latest)}`);
+        return {
+            macd: latest.MACD,
+            signal: latest.signal,
+            histogram: latest.histogram,
+        };
+    } catch (error) {
+        logger.error(`Failed to calculate MACD for ${symbol} (${timeframe}): ${error}`);
+        throw error;
+    }
+}
+EOF
+
+# Save volumeAnalysis.ts
+cat << 'EOF' > "$PROJECT_DIR/src/volume/volumeAnalysis.ts"
+import Binance from 'binance-api-node';
+import logger from '../utils/logger';
+
+export async function analyzeVolume(client: any, symbol: string, currentVolume: number | null, timeframe: string) {
+    try {
+        const candles = await client.candles({ symbol, interval: timeframe, limit: 10 });
+        const volumes = candles.map((c: any) => parseFloat(c.volume));
+        const avgVolume = volumes.slice(0, -1).reduce((a: number, b: number) => a + b, 0) / (volumes.length - 1);
+        const spike = currentVolume !== null ? currentVolume / avgVolume : volumes[volumes.length - 1] / avgVolume;
+        const threshold = timeframe === '1h' ? 2 : 2; // Strong spikes for scalping
+        const isSignificant = spike > threshold;
+        logger.info(`Volume analysis for ${symbol} (${timeframe}): spike=${spike.toFixed(2)}, significant=${isSignificant}`);
+        return { spike: parseFloat(spike.toFixed(2)), isSignificant };
+    } catch (error) {
+        logger.error(`Failed to analyze volume for ${symbol} (${timeframe}): ${error}`);
+        throw error;
+    }
+}
+EOF
+
+# Save stopLoss.ts
+cat << 'EOF' > "$PROJECT_DIR/src/indicators/stopLoss.ts"
+import Binance from 'binance-api-node';
+import logger from '../utils/logger';
+
+export async function calculateStopLoss(
+    client: any,
+    symbol: string,
+    currentPrice: number,
+    lookback = 10
+): Promise<number> {
+    const timeframe = '5m';
+    try {
+        if (!client || !client.candles) {
+            throw new Error('Invalid or uninitialized client');
+        }
+        if (!symbol) {
+            throw new Error('Symbol is not provided');
+        }
+        const candles = await client.candles({ symbol, interval: timeframe, limit: lookback });
+        const lows = candles.map((c: any) => parseFloat(c.low));
+        const supportLevel = Math.min(...lows);
+        const stopLossPercentage = ((currentPrice - supportLevel) / currentPrice) * 100;
+        const stopLoss = Math.max(parseFloat(stopLossPercentage.toFixed(2)), 0.3); // Tight for scalping
+        logger.info(`Calculated stop-loss for ${symbol} (${timeframe}): ${stopLoss}%`);
+        return stopLoss;
+    } catch (error) {
+        logger.error(`Failed to calculate stop-loss for ${symbol || 'undefined'}: ${error}`);
+        throw error;
+    }
+}
+
+export async function calculateTakeProfit(currentPrice: number): Promise<number> {
+    const targetProfit = 0.5; // 62.5% return on 125x leverage
+    logger.info(`Calculated take-profit for ${symbol}: ${targetProfit}%`);
+    return targetProfit;
+}
+EOF
+
+# Save signalGenerator.ts
+cat << 'EOF' > "$PROJECT_DIR/src/signals/signalGenerator.ts"
+import { calculateStopLoss, calculateTakeProfit } from '../indicators/stopLoss';
+import { fetchNewsSentiment } from '../news/newsFeed';
+import logger from '../utils/logger';
+
+let client: any;
+let symbol: string;
+
+export function setClientAndSymbol(_client: any, _symbol: string) {
+    client = _client;
+    symbol = _symbol;
+    logger.info(`Client and symbol set: ${symbol}`);
+}
+
+export async function generateSignal(data: {
+    volume: { [key: string]: { spike: number; isSignificant: boolean } };
+    orderBook: { buyerPressure: boolean };
+    rsi: { [key: string]: number };
+    macd: { [key: string]: { macd: number; signal: number; histogram: number } };
+    currentPrice: number;
+}) {
+    try {
+        if (!client || !symbol) {
+            throw new Error('Client or symbol not initialized');
+        }
+        const { volume, orderBook, rsi, macd, currentPrice } = data;
+        const stopLoss = await calculateStopLoss(client, symbol, currentPrice);
+        const takeProfit = await calculateTakeProfit(currentPrice);
+        const news = await fetchNewsSentiment();
+
+        const use5mConfirmation = false; // Toggle for 5m (set to true for stricter signals)
+
+        // LONG signal
+        if (
+            macd['1h'].histogram > 0 && rsi['1h'] > 50 && // Bullish 1h trend
+            (!use5mConfirmation || (rsi['5m'] < 25 && volume['5m'].isSignificant)) && // Optional 5m
+            rsi['1m'] < 20 && volume['1m'].isSignificant && orderBook.buyerPressure && macd['1m'].histogram > 0 &&
+            news.sentiment === 'Positive'
+        ) {
+            const signal = {
+                type: 'LONG',
+                rsi,
+                macd,
+                volume,
+                orderBook: { buyerPressure: true },
+                stopLoss,
+                takeProfit,
+                news: news.sentiment,
+                confidence: 'High',
+            };
+            logger.info(`Generated LONG signal for ${symbol}`);
+            return signal;
+        }
+
+        // SHORT signal
+        if (
+            macd['1h'].histogram < 0 && rsi['1h'] < 50 &&
+            (!use5mConfirmation || (rsi['5m'] > 75 && volume['5m'].isSignificant)) &&
+            rsi['1m'] > 80 && volume['1m'].isSignificant && !orderBook.buyerPressure && macd['1m'].histogram < 0 &&
+            news.sentiment === 'Negative'
+        ) {
+            const signal = {
+                type: 'SHORT',
+                rsi,
+                macd,
+                volume,
+                orderBook: { buyerPressure: false },
+                stopLoss,
+                takeProfit,
+                news: news.sentiment,
+                confidence: 'High',
+            };
+            logger.info(`Generated SHORT signal for ${symbol}`);
+            return signal;
+        }
+
+        logger.info(`No signal generated for ${symbol}`);
+        return null;
+    } catch (error) {
+        logger.error(`Failed to generate signal for ${symbol || 'undefined'}: ${error}`);
+        throw error;
+    }
+}
+EOF
+
+# Save signalGenerator.test.ts
+cat << 'EOF' > "$PROJECT_DIR/src/signals/signalGenerator.test.ts"
+import { generateSignal, setClientAndSymbol } from './signalGenerator';
+import { calculateStopLoss, calculateTakeProfit } from '../indicators/stopLoss';
+import { fetchNewsSentiment } from '../news/newsFeed';
+
+jest.mock('../indicators/stopLoss', () => ({
+    calculateStopLoss: jest.fn().mockResolvedValue(0.3),
+    calculateTakeProfit: jest.fn().mockResolvedValue(0.5),
+}));
+
+jest.mock('../news/newsFeed', () => ({
+    fetchNewsSentiment: jest.fn().mockResolvedValue({ sentiment: 'Positive', titles: ['BTC Bullish News'] }),
+}));
+
+describe('Signal Generator', () => {
+    beforeAll(() => {
+        setClientAndSymbol({}, 'BTCUSDT');
+    });
+
+    it('should generate a LONG signal for bullish conditions', async () => {
+        (fetchNewsSentiment as jest.Mock).mockResolvedValueOnce({ sentiment: 'Positive', titles: ['BTC Bullish News'] });
+        const input = {
+            volume: {
+                '1m': { spike: 2.5, isSignificant: true },
+                '5m': { spike: 2.0, isSignificant: true },
+                '1h': { spike: 2.0, isSignificant: true },
+            },
+            orderBook: { buyerPressure: true },
+            rsi: { '1m': 18, '5m': 22, '1h': 55 },
+            macd: {
+                '1m': { macd: 100, signal: 90, histogram: 10 },
+                '1h': { macd: 100, signal: 90, histogram: 10 },
+            },
+            currentPrice: 50000,
+        };
+
+        const signal = await generateSignal(input);
+        expect(signal).not.toBeNull();
+        expect(signal?.type).toBe('LONG');
+        expect(signal?.confidence).toBe('High');
+        expect(signal?.takeProfit).toBe(0.5);
+        expect(signal?.stopLoss).toBe(0.3);
+    });
+
+    it('should generate a SHORT signal for bearish conditions', async () => {
+        (fetchNewsSentiment as jest.Mock).mockResolvedValueOnce({ sentiment: 'Negative', titles: ['BTC Bearish News'] });
+        const input = {
+            volume: {
+                '1m': { spike: 2.5, isSignificant: true },
+                '5m': { spike: 2.0, isSignificant: true },
+                '1h': { spike: 2.0, isSignificant: true },
+            },
+            orderBook: { buyerPressure: false },
+            rsi: { '1m': 82, '5m': 78, '1h': 45 },
+            macd: {
+                '1m': { macd: 90, signal: 100, histogram: -10 },
+                '1h': { macd: 90, signal: 100, histogram: -10 },
+            },
+            currentPrice: 50000,
+        };
+
+        const signal = await generateSignal(input);
+        expect(signal).not.toBeNull();
+        expect(signal?.type).toBe('SHORT');
+        expect(signal?.confidence).toBe('High');
+        expect(signal?.takeProfit).toBe(0.5);
+        expect(signal?.stopLoss).toBe(0.3);
+    });
+
+    it('should return null for unaligned conditions', async () => {
+        (fetchNewsSentiment as jest.Mock).mockResolvedValueOnce({ sentiment: 'Neutral', titles: ['BTC News'] });
+        const input = {
+            volume: {
+                '1m': { spike: 1.1, isSignificant: false },
+                '5m': { spike: 1.1, isSignificant: false },
+                '1h': { spike: 1.1, isSignificant: false },
+            },
+            orderBook: { buyerPressure: false },
+            rsi: { '1m': 50, '5m': 50, '1h': 50 },
+            macd: {
+                '1m': { macd: 100, signal: 100, histogram: 0 },
+                '1h': { macd: 100, signal: 100, histogram: 0 },
+            },
+            currentPrice: 50000,
+        };
+
+        const signal = await generateSignal(input);
+        expect(signal).toBeNull();
+    });
+});
+EOF
+
+# Save package.json
+cat << 'EOF' > "$PROJECT_DIR/package.json"
+{
+    "name": "crypto-trader-bot",
+        "version": "1.0.0",
+            "description": "A real-time crypto trading bot",
+                "main": "dist/index.js",
+                    "scripts": {
+        "start": "tsc && node dist/index.js",
+            "build": "tsc",
+                "test": "jest",
+                    "test:watch": "jest --watch"
+    },
+    "dependencies": {
+        "axios": "^1.7.2",
+            "binance-api-node": "^0.12.8",
+                "bottleneck": "^2.19.5",
+                    "ccxt": "^4.3.29",
+                        "dotenv": "^16.4.5",
+                            "node-telegram-bot-api": "^0.66.0",
+                                "technicalindicators": "^3.1.0",
+                                    "winston": "^3.13.0",
+                                        "ws": "^8.17.0"
+    },
+    "devDependencies": {
+        "@types/jest": "^29.5.12",
+            "@types/node": "^20.12.7",
+                "@types/node-telegram-bot-api": "^0.64.7",
+                    "jest": "^29.7.0",
+                        "ts-jest": "^29.1.2",
+                            "ts-node": "^10.9.2",
+                                "typescript": "^5.4.5"
+    }
+}
+EOF
+
+echo "Files created in $PROJECT_DIR"
