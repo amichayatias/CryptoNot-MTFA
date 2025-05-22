@@ -1,19 +1,3 @@
-import { calculateStopLoss, calculateTakeProfit } from '../indicators/stopLoss';
-import { fetchNewsSentiment } from '../news/newsFeed';
-import logger from '../utils/logger';
-
-let client: any;
-let symbol: string;
-
-export function setClientAndSymbol(_client: any, _symbol: string) {
-  client = _client;
-  symbol = _symbol;
-  logger.info(`Client and symbol set: ${symbol}`);
-}
-
-
-
-
 export async function generateSignal(data: {
   volume: { [key: string]: { spike: number; isSignificant: boolean } };
   orderBook: { buyerPressure: boolean };
@@ -29,17 +13,10 @@ export async function generateSignal(data: {
     const { volume, orderBook, rsi, macd, currentPrice } = data;
     const news = await fetchNewsSentiment();
 
-    const use5mConfirmation = true;
-    const threshold = 6;
+    const use5mConfirmation = false;
 
     let longScore = 0;
     let shortScore = 0;
-
-    // Fetch recent candles for price trend
-    const candles = await client.candles({ symbol, interval: '5m', limit: 5 });
-    const closes = candles.map((c: any) => parseFloat(c.close));
-    const sma5 = closes.reduce((a: number, b: number) => a + b, 0) / 5;
-    const priceTrend = currentPrice > sma5 ? 'Up' : 'Down';
 
     // === LONG CONDITIONS ===
     if (macd['1h'].histogram > 0) longScore += 2;
@@ -50,7 +27,6 @@ export async function generateSignal(data: {
     if (orderBook.buyerPressure) longScore += 1;
     if (macd['1m'].histogram > 0) longScore += 1;
     if (news.sentiment === 'Positive') longScore += 1;
-    if (priceTrend === 'Up') longScore += 1; // Favor long if price is rising
 
     // === SHORT CONDITIONS ===
     if (macd['1h'].histogram < 0) shortScore += 2;
@@ -61,9 +37,8 @@ export async function generateSignal(data: {
     if (!orderBook.buyerPressure) shortScore += 1;
     if (macd['1m'].histogram < 0) shortScore += 1;
     if (news.sentiment === 'Negative') shortScore += 1;
-    if (priceTrend === 'Down') shortScore += 1; // Favor short if price is falling
 
-
+    const threshold = 5;
 
     logger.info({
       context: "Signal scoring",
@@ -75,8 +50,9 @@ export async function generateSignal(data: {
       volume,
       orderBook,
       news: news.sentiment,
-      priceTrend,
     });
+
+
 
     if (longScore >= threshold && longScore > shortScore) {
       let stopLoss = await calculateStopLoss(client, symbol, currentPrice, 'LONG');
@@ -99,7 +75,7 @@ export async function generateSignal(data: {
       return signal;
     }
 
-    if (shortScore >= threshold && shortScore > longScore && priceTrend !== 'Up') {
+    if (shortScore >= threshold && shortScore > longScore) {
       let stopLoss = await calculateStopLoss(client, symbol, currentPrice, 'SHORT');
       let takeProfit = await calculateTakeProfit(symbol, currentPrice, 'SHORT');
 
@@ -120,23 +96,27 @@ export async function generateSignal(data: {
       return signal;
     }
 
-
-    const signal = {
+    /* 
+     const signal = {
       type: 'NEUTRAL',
-      symbol,
       currentPrice,
+      symbol,
       rsi,
       macd,
       volume,
       orderBook,
-      stopLoss: { stopLossPercent: 0, stopLossPrice: 0 },
-      takeProfit: { takeProfitPercent: 0, takeProfitPrice: 0 },
+      stopLoss,
+      takeProfit,
       news: news.sentiment,
-      confidence: `SS: ${shortScore}/10 - LS: ${longScore}/10`,
+      confidence: 'LOW',
     };
-    logger.info(`Generated SHORT signal for ${symbol}`);
-    return signal;
 
+    return signal;
+    */
+
+    logger.info(`Generated NEUTRAL signal for ${symbol}`);
+
+    return null
   } catch (error) {
     logger.error(`Failed to generate signal for ${symbol || 'undefined'}: ${error}`);
     throw error;

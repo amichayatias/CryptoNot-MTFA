@@ -1,6 +1,7 @@
-import { generateSignal, setClientAndSymbol } from './signalGenerator';
+
 import { calculateStopLoss, calculateTakeProfit } from '../indicators/stopLoss';
 import { fetchNewsSentiment } from '../news/newsFeed';
+import { generateSignal, setClientAndSymbol } from './signalGenerator';
 
 jest.mock('../indicators/stopLoss', () => ({
   calculateStopLoss: jest.fn().mockResolvedValue(0.3),

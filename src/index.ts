@@ -8,6 +8,7 @@ import { generateSignal, setClientAndSymbol } from './signals/signalGenerator';
 import { sendTelegramMessage } from './telegram/telegramBot';
 import { calculateRSI, calculateMACD } from './indicators/technicalIndicators';
 import logger from './utils/logger';
+import { reportTrade } from './trade/trade';
 
 const limiter = new Bottleneck({
   minTime: 50, // 50ms for scalping speed
@@ -23,8 +24,8 @@ logger.info(`Client initialized: ${client ? 'success' : 'failure'}`);
 
 const symbol = 'BTCUSDT';
 const primaryTimeframe = '1m';
-const trendTimeframe = '1h';
 const confirmationTimeframe = '5m';
+const trendTimeframe = '1h';
 
 // Cache for higher timeframe data
 let cached1hData: { volume: any; rsi: any; macd: any; } | null = null;
@@ -107,6 +108,11 @@ async function startBot() {
 
           if (signal) {
             await sendTelegramMessage(formatSignalMessage(signal));
+
+            //send alert trade
+            if (signal.type == "LONG" || signal.type == "SHORT")
+              await sendTelegramMessage(await reportTrade(signal));
+
             logger.info(`Signal generated: ${signal.type}`);
           }
         }
@@ -114,7 +120,10 @@ async function startBot() {
         logger.error(`Error processing WebSocket message: ${error}`);
       }
     });
-
+    ws.on('close', () => {
+      logger.warn('WebSocket closed. Reconnecting...');
+      setTimeout(startBot, 5000);
+    });
     ws.on('error', (error) => {
       logger.error(`WebSocket error: ${error}`);
     });
@@ -123,23 +132,51 @@ async function startBot() {
   }
 }
 
-function formatSignalMessage(signal: any): string {
+function formatSignalMessage_1(signal: any): string {
   return `
 (${signal.type == "LONG" ? '🟢' : signal.type == "SHORT" ? '🔴' : '🔵'}) ${signal.type} (${signal.type == "LONG" ? '🟢' : signal.type == "SHORT" ? '🔴' : '🔵'})
 📈  Signal – ${symbol} (1m entry)
+• Price: ${signal.currentPrice}
 • 1m RSI: ${signal.rsi['1m'].toFixed(2)} (${signal.rsi['1m'] < 20 ? 'Oversold' : signal.rsi['1m'] > 80 ? 'Overbought' : 'Normal'})
 • 5m RSI: ${signal.rsi['5m'].toFixed(2)}
 • 1h Trend: ${signal.macd['1h'].histogram > 0 ? 'Bullish' : 'Bearish'}
 • Volume Spike: 1m=${signal.volume['1m'].spike}x
 • Order book: ${signal.orderBook.buyerPressure ? 'Buyers dominate' : 'Sellers dominate'}
 • News Sentiment: ${signal.news}
-• SL: ${signal.stopLoss}% below entry
-• TP: ${signal.takeProfit}% above entry
+• SL: ${signal.stopLoss.stopLossPercent}% Price:${signal.stopLoss.stopLossPrice}
+• TP: ${signal.takeProfit.takeProfitPercent}% Price:${signal.takeProfit.takeProfitPrice}
 ⏰ Time: ${new Date().toUTCString()}
 📊 Exchange: Binance
 🧠 Confidence: ${signal.confidence}
   `;
 }
+
+
+
+function formatSignalMessage(signal: any): string {
+  return `
+*${signal.type === 'LONG' ? 'LONG' : signal.type === 'SHORT' ? 'SHORT' : 'NEUTRAL'} SIGNAL ALERT*
+
+*Symbol:* ${signal.symbol}
+*Entry Price:* $${signal.currentPrice.toFixed(2)}
+*1m RSI:* ${signal.rsi['1m'].toFixed(2)} (${signal.rsi['1m'] < 20 ? 'Oversold' : signal.rsi['1m'] > 80 ? 'Overbought' : 'Neutral'})
+*5m RSI:* ${signal.rsi['5m'].toFixed(2)}
+*1h Trend:* ${signal.macd['1h'].histogram > 0 ? 'Bullish' : 'Bearish'}
+*Volume Spike:* 1m=${signal.volume['1m'].spike.toFixed(2)}x
+*Order Book:* ${signal.orderBook.buyerPressure ? 'Buyers dominate' : 'Sellers dominate'}
+*News Sentiment:* ${signal.news}
+*Stop Loss:* ${signal.stopLoss.stopLossPercent.toFixed(2)}% ($${signal.stopLoss.stopLossPrice.toFixed(2)})
+*Take Profit:* ${signal.takeProfit.takeProfitPercent.toFixed(2)}% ($${signal.takeProfit.takeProfitPrice.toFixed(2)})
+*Confidence:* ${signal.confidence}
+*Timestamp:* ${new Date().toUTCString()}
+
+*Exchange:* Binance
+  `.trim();
+}
+
+
+
+
 
 startBot().catch((error) => logger.error(`Bot startup error: ${error}`));
 
